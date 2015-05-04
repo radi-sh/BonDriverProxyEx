@@ -2,6 +2,7 @@
 #define __BONDRIVER_PROXYEX_H__
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <stdio.h>
 #include <tchar.h>
 #include <process.h>
 #include <list>
@@ -27,6 +28,9 @@ static DWORD g_TsPacketBufSize;
 static DWORD g_OpenTunerRetDelay;
 static BOOL g_SandBoxedRelease;
 static BOOL g_DisableUnloadBonDriver;
+static DWORD g_ProcessPriority;		// ïsóvÇæÇ∆évÇ§ÇØÇ«ï€éùÇµÇƒÇ®Ç≠
+static int g_ThreadPriorityTsReader;
+static int g_ThreadPrioritySender;
 
 #include "BdpPacket.h"
 

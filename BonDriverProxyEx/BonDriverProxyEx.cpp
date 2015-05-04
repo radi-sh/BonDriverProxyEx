@@ -30,6 +30,74 @@ static int Init(HMODULE hModule)
 	g_PacketFifoSize = GetPrivateProfileIntA("SYSTEM", "PACKET_FIFO_SIZE", 64, szIniPath);
 	g_TsPacketBufSize = GetPrivateProfileIntA("SYSTEM", "TSPACKET_BUFSIZE", (188 * 1024), szIniPath);
 
+	char szPriority[128] = "";
+	GetPrivateProfileStringA("SYSTEM", "PROCESSPRIORITY", "ABOVE_NORMAL", szPriority, sizeof(szPriority), szIniPath);
+	if (strcmp(szPriority, "REALTIME") == 0) {
+		g_ProcessPriority = REALTIME_PRIORITY_CLASS;
+	}
+	else if (strcmp(szPriority, "HIGH") == 0) {
+		g_ProcessPriority = HIGH_PRIORITY_CLASS;
+	}
+	else if (strcmp(szPriority, "ABOVE_NORMAL") == 0) {
+		g_ProcessPriority = ABOVE_NORMAL_PRIORITY_CLASS;
+	}
+	else if (strcmp(szPriority, "NORMAL") == 0) {
+		g_ProcessPriority = NORMAL_PRIORITY_CLASS;
+	}
+	else if (strcmp(szPriority, "BELOW_NORMAL") == 0) {
+		g_ProcessPriority = BELOW_NORMAL_PRIORITY_CLASS;
+	}
+	else if (strcmp(szPriority, "IDLE") == 0) {
+		g_ProcessPriority = IDLE_PRIORITY_CLASS;
+	}
+	::SetPriorityClass(::GetCurrentProcess(), g_ProcessPriority);
+
+	GetPrivateProfileStringA("SYSTEM", "THREADPRIORITY_TSREADER", "NORMAL", szPriority, sizeof(szPriority), szIniPath);
+	if (strcmp(szPriority, "CRITICAL") == 0) {
+		g_ThreadPriorityTsReader = THREAD_PRIORITY_TIME_CRITICAL;
+	}
+	else if (strcmp(szPriority, "HIGHEST") == 0) {
+		g_ThreadPriorityTsReader = THREAD_PRIORITY_HIGHEST;
+	}
+	else if (strcmp(szPriority, "ABOVE_NORMAL") == 0) {
+		g_ThreadPriorityTsReader = THREAD_PRIORITY_ABOVE_NORMAL;
+	}
+	else if (strcmp(szPriority, "NORMAL") == 0) {
+		g_ThreadPriorityTsReader = THREAD_PRIORITY_NORMAL;
+	}
+	else if (strcmp(szPriority, "BELOW_NORMAL") == 0) {
+		g_ThreadPriorityTsReader = THREAD_PRIORITY_BELOW_NORMAL;
+	}
+	else if (strcmp(szPriority, "LOWEST") == 0) {
+		g_ThreadPriorityTsReader = THREAD_PRIORITY_LOWEST;
+	}
+	else if (strcmp(szPriority, "IDLE") == 0) {
+		g_ThreadPriorityTsReader = THREAD_PRIORITY_IDLE;
+	}
+
+	GetPrivateProfileStringA("SYSTEM", "THREADPRIORITY_SENDER", "NORMAL", szPriority, sizeof(szPriority), szIniPath);
+	if (strcmp(szPriority, "CRITICAL") == 0) {
+		g_ThreadPrioritySender = THREAD_PRIORITY_TIME_CRITICAL;
+	}
+	else if (strcmp(szPriority, "HIGHEST") == 0) {
+		g_ThreadPrioritySender = THREAD_PRIORITY_HIGHEST;
+	}
+	else if (strcmp(szPriority, "ABOVE_NORMAL") == 0) {
+		g_ThreadPrioritySender = THREAD_PRIORITY_ABOVE_NORMAL;
+	}
+	else if (strcmp(szPriority, "NORMAL") == 0) {
+		g_ThreadPrioritySender = THREAD_PRIORITY_NORMAL;
+	}
+	else if (strcmp(szPriority, "BELOW_NORMAL") == 0) {
+		g_ThreadPrioritySender = THREAD_PRIORITY_BELOW_NORMAL;
+	}
+	else if (strcmp(szPriority, "LOWEST") == 0) {
+		g_ThreadPrioritySender = THREAD_PRIORITY_LOWEST;
+	}
+	else if (strcmp(szPriority, "IDLE") == 0) {
+		g_ThreadPrioritySender = THREAD_PRIORITY_IDLE;
+	}
+
 	{
 		// [OPTION]
 		// BONDRIVER=PT-T
@@ -215,6 +283,7 @@ DWORD cProxyServerEx::Process()
 	hThread[0] = ::CreateThread(NULL, 0, cProxyServerEx::Sender, this, 0, NULL);
 	if (hThread[0] == NULL)
 		return 1;
+	::SetThreadPriority(hThread[0], g_ThreadPrioritySender);
 
 	hThread[1] = ::CreateThread(NULL, 0, cProxyServerEx::Receiver, this, 0, NULL);
 	if (hThread[1] == NULL)
@@ -685,6 +754,8 @@ DWORD cProxyServerEx::Process()
 										m_pTsReaderArg = NULL;
 										m_Error.Set();
 									}
+								else
+									::SetThreadPriority(m_hTsRead, g_ThreadPriorityTsReader);
 								}
 								if (bSetChannel)
 								{
