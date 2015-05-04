@@ -68,7 +68,7 @@ class cProxyServerEx {
 	HANDLE m_hTsRead;
 	BOOL m_bChannelLock;
 	stTsReaderArg *m_pTsReaderArg;
-#if _DEBUG
+#if !BUILD_AS_SERVICE && _DEBUG
 public:
 #endif
 	DWORD m_dwSpace;
@@ -79,7 +79,7 @@ public:
 	cPacketFifo m_fifoSend;
 	cPacketFifo m_fifoRecv;
 
-#if _DEBUG
+#if !BUILD_AS_SERVICE && _DEBUG
 private:
 #endif
 	DWORD Process();
@@ -121,5 +121,50 @@ public:
 
 static std::list<cProxyServerEx *> g_InstanceList;
 static cCriticalSection g_Lock;
+static cEvent g_TerminateRequest(TRUE, FALSE);
+#if BUILD_AS_SERVICE
+// サービスのメイン
+void WINAPI ServiceMain(DWORD argc, LPTSTR *argv);
+// サービスコントロールハンドラ
+DWORD WINAPI HandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext);
+
+class CWinService
+{
+public:
+	CWinService();
+	virtual ~CWinService();
+
+	// インストールとアンインストール
+	BOOL Install();
+	BOOL Remove();
+
+	// 起動・停止・再起動
+	BOOL Start();
+	BOOL Stop();
+	BOOL Restart();
+
+	// 実行
+	BOOL Run(LPSERVICE_MAIN_FUNCTIONW lpServiceProc);
+
+	DWORD WINAPI ServiceCtrlHandler(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext);
+
+	BOOL RegisterService(LPHANDLER_FUNCTION_EX lpHandlerProc);
+	void ServiceRunning();
+	void ServiceStopped();
+
+private:
+	SERVICE_STATUS serviceStatus;
+	SERVICE_STATUS_HANDLE serviceStatusHandle;
+
+	//サービス名称保持
+	TCHAR serviceName[BUFSIZ];
+	TCHAR serviceExePath[BUFSIZ];
+
+	//終了イベント
+	HANDLE  hServerStopEvent;
+};
+
+static CWinService *lpCWinService = NULL;
+#endif
 
 #endif	// __BONDRIVER_PROXYEX_H__

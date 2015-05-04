@@ -103,6 +103,16 @@ static int Init(HMODULE hModule)
 	return 0;
 }
 
+static void TerminateInstance()
+{
+	// いきなり FreeLibraryされるとまずいBonDriverがあるので
+	// 先にcProxyServerExインスタンスを終了させる
+	if (!g_TerminateRequest.IsSet())
+		g_TerminateRequest.Set();
+	while (g_InstanceList.size() != 0)
+		::Sleep(10);
+}
+
 static void CleanUp()
 {
 	for (int i = 0; i < MAX_DRIVERS; i++)
@@ -215,10 +225,10 @@ DWORD cProxyServerEx::Process()
 		return 2;
 	}
 
-	HANDLE h[2] = { m_Error, m_fifoRecv.GetEventHandle() };
+	HANDLE h[3] = { m_Error, m_fifoRecv.GetEventHandle(), g_TerminateRequest };
 	for (;;)
 	{
-		DWORD dwRet = ::WaitForMultipleObjects(2, h, FALSE, INFINITE);
+		DWORD dwRet = ::WaitForMultipleObjects(3, h, FALSE, INFINITE);
 		switch (dwRet)
 		{
 		case WAIT_OBJECT_0:
@@ -737,6 +747,8 @@ DWORD cProxyServerEx::Process()
 			break;
 		}
 
+		case WAIT_OBJECT_0 + 2:
+			// 終了要求
 		default:
 			// 何かのエラー
 			m_Error.Set();
@@ -1357,7 +1369,7 @@ const BOOL cProxyServerEx::SetLnbPower(const BOOL bEnable)
 	return b;
 }
 
-#if _DEBUG
+#if BUILD_AS_SERVICE || _DEBUG
 struct HostInfo{
 	char *host;
 	char *port;
@@ -1373,6 +1385,9 @@ static int Listen(char *host, char *port)
 #endif
 	addrinfo hints, *results, *rp;
 	SOCKET lsock, csock;
+	int len;
+	fd_set rd;
+	timeval tv;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -1410,25 +1425,35 @@ static int Listen(char *host, char *port)
 		return 3;
 	}
 
-	for (;;)
+	tv.tv_sec = 0;
+	tv.tv_usec = 100;
+	while (!g_TerminateRequest.IsSet())
 	{
-		csock = accept(lsock, NULL, NULL);
-		if (csock == INVALID_SOCKET)
-			continue;
+		FD_ZERO(&rd);
+		FD_SET(lsock, &rd);
+		if ((len = ::select((int)(lsock + 1), &rd, NULL, NULL, &tv)) == SOCKET_ERROR)
+			return 4;
 
-		cProxyServerEx *pProxy = new cProxyServerEx();
-		pProxy->setSocket(csock);
-		HANDLE hThread = ::CreateThread(NULL, 0, cProxyServerEx::Reception, pProxy, 0, NULL);
-		if (hThread)
-			CloseHandle(hThread);
-		else
-			delete pProxy;
+		if (len > 0) {
+			csock = accept(lsock, NULL, NULL);
+
+			if (csock == INVALID_SOCKET)
+				continue;
+
+			cProxyServerEx *pProxy = new cProxyServerEx();
+			pProxy->setSocket(csock);
+			HANDLE hThread = ::CreateThread(NULL, 0, cProxyServerEx::Reception, pProxy, 0, NULL);
+			if (hThread)
+				CloseHandle(hThread);
+			else
+				delete pProxy;
+		}
 	}
 
-	return 0;	// ここには来ない
+	return 0;
 }
 
-#if _DEBUG
+#if !BUILD_AS_SERVICE && _DEBUG
 LRESULT CALLBACK WndProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (iMsg)
@@ -1492,7 +1517,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE/*hPrevInstance*/, LPSTR/*lpCmd
 	hinfo.host = g_Host;
 	hinfo.port = g_Port;
 	HANDLE hThread = CreateThread(NULL, 0, Listen, &hinfo, 0, NULL);
-	CloseHandle(hThread);
 
 	HWND hWnd;
 	MSG msg;
@@ -1524,6 +1548,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE/*hPrevInstance*/, LPSTR/*lpCmd
 		DispatchMessage(&msg);
 	}
 
+	g_TerminateRequest.Set();
+	if (hThread)
+	{
+		::WaitForSingleObject(hThread, INFINITE);
+		::CloseHandle(hThread);
+	}
+
+	TerminateInstance();
 	{
 		LOCK(g_Lock);
 		CleanUp();
@@ -1543,7 +1575,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE/*hPrevInstance*/, LPSTR/*lpCmd
 	return (int)msg.wParam;
 }
 #else
+#if !BUILD_AS_SERVICE
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE/*hPrevInstance*/, LPSTR/*lpCmdLine*/, int/*nCmdShow*/)
+#else
+static int RunOnCmd(HINSTANCE hInstance)
+#endif
 {
 	if (Init(hInstance) != 0)
 		return -1;
@@ -1552,10 +1588,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE/*hPrevInstance*/, LPSTR/*lpCmd
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
 		return -2;
 
+#if !BUILD_AS_SERVICE
 	int ret = Listen(g_Host, g_Port);
+#else
+	HostInfo hinfo;
+	hinfo.host = g_Host;
+	hinfo.port = g_Port;
+	int ret = (int)Listen(&hinfo);
+#endif
 
+	TerminateInstance();
 	{
-		// 来ないけど一応
 		LOCK(g_Lock);
 		CleanUp();
 	}
@@ -1563,4 +1606,640 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE/*hPrevInstance*/, LPSTR/*lpCmd
 	WSACleanup();
 	return ret;
 }
+#endif
+#if BUILD_AS_SERVICE
+#include <locale.h>
+BOOL WINAPI HandlerRoutine(DWORD dwCtrlType)
+{
+	switch (dwCtrlType)
+	{
+	case CTRL_C_EVENT:
+		g_TerminateRequest.Set();
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+int _tmain(int argc, _TCHAR *argv [], _TCHAR *envp [])
+{
+#if _DEBUG
+	_CrtMemState ostate, nstate, dstate;
+	_CrtMemCheckpoint(&ostate);
+	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+	HANDLE hLogFile = NULL;
+#endif
+
+	int ret = 0;
+	lpCWinService = new CWinService();
+	if (lpCWinService)
+	{
+		_tsetlocale(LC_ALL, _T(""));
+		do
+		{
+			if (argc == 1)
+			{
+				// 引数なしで起動された
+#if _DEBUG
+				TCHAR szDrive[4] = _T("");
+				TCHAR szPath[MAX_PATH] = _T("");
+				TCHAR szLogFile[MAX_PATH + 16] = _T("");
+				GetModuleFileName(NULL, szPath, MAX_PATH);
+				_tsplitpath_s(szPath, szDrive, 4, szPath, MAX_PATH, NULL, 0, NULL, 0);
+				_tmakepath_s(szLogFile, MAX_PATH + 16, szDrive, szPath, _T("dbglog"), _T(".txt"));
+				hLogFile = CreateFile(szLogFile, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+				SetFilePointer(hLogFile, 0, NULL, FILE_END);
+				_CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+				_CrtSetReportFile(_CRT_WARN, hLogFile);
+				_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+				_CrtSetReportFile(_CRT_ERROR, hLogFile);
+				_RPT0(_CRT_WARN, "--- PROCESS_START ---\n");
+#endif
+				if (lpCWinService->Run(ServiceMain))
+					// サービスだった
+					break;
+				else
+				{
+					// サービスではない
+					_tprintf(_T("コンソールモードで開始します...Ctrl+Cで終了\n"));
+					SetConsoleCtrlHandler(HandlerRoutine, TRUE);
+					ret = RunOnCmd(GetModuleHandle(NULL));
+					switch (ret)
+					{
+					case -1:
+						_tprintf(_T("iniファイルの読込に失敗しました\n"));
+						break;
+					case -2:
+						_tprintf(_T("winsockの初期化に失敗しました\n"));
+						break;
+					case 1:
+						_tprintf(_T("Hostアドレスの解決に失敗しました\n"));
+						break;
+					case 2:
+						_tprintf(_T("bind()に失敗しました\n"));
+						break;
+					case 3:
+						_tprintf(_T("listen()に失敗しました\n"));
+						break;
+					case 4:
+						_tprintf(_T("accept()中にエラーが発生しました\n"));
+						break;
+					case 0:
+						_tprintf(_T("終了します\n"));
+						break;
+					}
+					break;
+				}
+			}
+			else
+			{
+				// 引数あり
+				BOOL done = FALSE;
+				for (int i = 1; i < argc; i++)
+				{
+					if (_tcscmp(argv[i], _T("install")) == 0)
+					{
+						if (lpCWinService->Install())
+							_tprintf(_T("Windowsサービスとして登録しました\n"));
+						else
+							_tprintf(_T("Windowsサービスとしての登録に失敗しました\n"));
+						done = TRUE;
+						break;
+					}
+					else if (_tcscmp(argv[i], _T("remove")) == 0)
+					{
+						if (lpCWinService->Remove())
+							_tprintf(_T("Windowsサービスから削除しました\n"));
+						else
+							_tprintf(_T("Windowsサービスからの削除に失敗しました\n"));
+						done = TRUE;
+						break;
+					}
+					else if (_tcscmp(argv[i], _T("start")) == 0)
+					{
+						if (lpCWinService->Start())
+							_tprintf(_T("Windowsサービスを起動しました\n"));
+						else
+							_tprintf(_T("Windowsサービスの起動に失敗しました\n"));
+						done = TRUE;
+						break;
+					}
+					else if (_tcscmp(argv[i], _T("stop")) == 0)
+					{
+						if (lpCWinService->Stop())
+							_tprintf(_T("Windowsサービスを停止しました\n"));
+						else
+							_tprintf(_T("Windowsサービスの停止に失敗しました\n"));
+						done = TRUE;
+						break;
+					}
+					else if (_tcscmp(argv[i], _T("restart")) == 0)
+					{
+						if (lpCWinService->Restart())
+							_tprintf(_T("Windowsサービスを再起動しました\n"));
+						else
+							_tprintf(_T("Windowsサービスの再起動に失敗しました\n"));
+						done = TRUE;
+						break;
+					}
+				}
+				if (done)
+					break;
+			}
+			// Usage表示
+			_tprintf(_T("Usage: %s <command>\n")
+					_T("コマンド\n")
+					_T("  install    Windowsサービスとして登録します\n")
+					_T("  remove     Windowsサービスから削除します\n")
+					_T("  start      Windowsサービスを起動します\n")
+					_T("  stop       Windowsサービスを停止します\n")
+					_T("  restart    Windowsサービスを再起動します\n")
+					_T("\n")
+					_T("引数なしで起動された場合、コンソールモードで動作します\n"),
+					argv[0]);
+		}
+		while (0);
+		delete (lpCWinService);
+	}
+	else
+	{
+		_tprintf(_T("Windowsサービスクラスの初期化に失敗しました\n"));
+		ret = -1;
+	}
+
+#if _DEBUG
+	_CrtMemCheckpoint(&nstate);
+	if (_CrtMemDifference(&dstate, &ostate, &nstate))
+	{
+		_CrtMemDumpStatistics(&dstate);
+		_CrtMemDumpAllObjectsSince(&ostate);
+	}
+	if (hLogFile) {
+		_RPT0(_CRT_WARN, "--- PROCESS_END ---\n");
+		CloseHandle(hLogFile);
+	}
+#endif
+
+	return ret;
+}
+
+void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
+{
+	if (!lpCWinService->RegisterService(HandlerEx))
+	{
+		return;
+	}
+
+	WSADATA *wsa = NULL;
+
+	do
+	{
+		if (Init(NULL) != 0)
+			break;
+
+		wsa = new WSADATA;
+		if (WSAStartup(MAKEWORD(2, 2), wsa) != 0)
+		{
+			delete(wsa);
+			wsa = NULL;
+			break;
+		}
+
+		HostInfo hinfo;
+		hinfo.host = g_Host;
+		hinfo.port = g_Port;
+		HANDLE hThread = CreateThread(NULL, 0, Listen, &hinfo, 0, NULL);
+
+		if (hThread)
+		{
+			lpCWinService->ServiceRunning();
+
+			g_TerminateRequest.Set();
+			::WaitForSingleObject(hThread, INFINITE);
+
+			::CloseHandle(hThread);
+		}
+
+		TerminateInstance();
+		{
+			LOCK(g_Lock);
+			CleanUp();
+		}
+	}
+	while (0);
+
+	if (wsa)
+	{
+		WSACleanup();
+		wsa = NULL;
+	}
+
+	lpCWinService->ServiceStopped();
+
+	return;
+}
+
+DWORD WINAPI HandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext)
+{
+	return lpCWinService->ServiceCtrlHandler(dwControl, dwEventType, lpEventData, lpContext);
+}
+
+CWinService::CWinService()
+{
+	//初期化
+	hServerStopEvent = NULL;
+
+	// サービス名を設定する
+	::GetModuleFileName(NULL, serviceExePath, BUFSIZ);
+	::_tsplitpath_s(serviceExePath, NULL, 0, NULL, 0, serviceName, BUFSIZ, NULL, 0);
+}
+
+CWinService::~CWinService()
+{
+
+}
+
+//
+// SCMへのインストール
+//
+BOOL CWinService::Install()
+{
+	SC_HANDLE hManager = NULL;
+	SC_HANDLE hService = NULL;
+	BOOL ret = FALSE;
+
+	do
+	{
+		hManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+		if (hManager == NULL)
+		{
+			break;
+		}
+
+		hService = CreateService(hManager,
+			serviceName,			   // service name
+			serviceName,			   // service name to display 
+			SERVICE_ALL_ACCESS,        // desired access 
+			SERVICE_WIN32_OWN_PROCESS | SERVICE_INTERACTIVE_PROCESS,  // service type 
+			SERVICE_DEMAND_START,      // start type 
+			SERVICE_ERROR_NORMAL,      // error control type 
+			serviceExePath,            // service's binary 
+			NULL,                      // no load ordering group 
+			NULL,                      // no tag identifier 
+			NULL,                      // no dependencies 
+			NULL,                      // LocalSystem account 
+			NULL);                     // no password 
+		if (hService == NULL)
+		{
+			break;
+		}
+
+		ret = TRUE;
+	}
+	while (0);
+
+	if (hService)
+	{
+		CloseServiceHandle(hService);
+	}
+
+	if (hManager)
+	{
+		CloseServiceHandle(hManager);
+	}
+
+	return ret;
+}
+
+//
+// SCMから削除
+//
+BOOL CWinService::Remove()
+{
+	SC_HANDLE hManager = NULL;
+	SC_HANDLE hService = NULL;
+	BOOL ret = FALSE;
+
+	do
+	{
+		hManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+		if (hManager == NULL)
+		{
+			break;
+		}
+
+		hService = OpenService(hManager, serviceName, SERVICE_ALL_ACCESS);
+		if (hService == NULL)
+		{
+			break;
+		}
+
+		if (DeleteService(hService) == 0)
+		{
+			break;
+		}
+
+		ret = TRUE;
+	}
+	while (0);
+
+	if (hService)
+	{
+		CloseServiceHandle(hService);
+	}
+
+	if (hManager)
+	{
+		CloseServiceHandle(hManager);
+	}
+
+	return ret;
+}
+
+//
+// サービス起動
+//
+BOOL CWinService::Start()
+{
+	SC_HANDLE hManager = NULL;
+	SC_HANDLE hService = NULL;
+	BOOL ret = FALSE;
+	SERVICE_STATUS sStatus;
+	DWORD waited = 0;
+
+	do
+	{
+		hManager = OpenSCManager(NULL, NULL, GENERIC_EXECUTE);
+		if (hManager == NULL)
+		{
+			break;
+		}
+
+		hService = OpenService(hManager, serviceName, SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS);
+		if (hService == NULL)
+		{
+			break;
+		}
+
+		if (QueryServiceStatus(hService, &sStatus) == 0)
+		{
+			break;
+		}
+
+		if (sStatus.dwCurrentState == SERVICE_RUNNING)
+		{
+			ret = TRUE;
+			break;
+		}
+
+		if (StartService(hService, NULL, NULL) == 0)
+		{
+			break;
+		}
+
+		while (1)
+		{
+			if (QueryServiceStatus(hService, &sStatus) == 0)
+			{
+				break;
+			}
+
+			if (sStatus.dwCurrentState == SERVICE_RUNNING)
+			{
+				ret = TRUE;
+				break;
+			}
+
+			if (waited >= sStatus.dwWaitHint)
+			{
+				break;
+			}
+
+			Sleep(500);
+			waited += 500;
+		}
+	}
+	while (0);
+
+	if (hService)
+	{
+		CloseServiceHandle(hService);
+	}
+
+	if (hManager)
+	{
+		CloseServiceHandle(hManager);
+	}
+
+	return ret;
+}
+
+//
+// サービス停止
+//
+BOOL CWinService::Stop()
+{
+	SC_HANDLE hManager = NULL;
+	SC_HANDLE hService = NULL;
+	BOOL ret = FALSE;
+	SERVICE_STATUS sStatus;
+	DWORD waited = 0;
+
+	do
+	{
+		hManager = OpenSCManager(NULL, NULL, GENERIC_EXECUTE);
+		if (hManager == NULL)
+		{
+			break;
+		}
+
+		hService = OpenService(hManager, serviceName, SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS);
+		if (hService == NULL) {
+			break;
+		}
+
+		if (QueryServiceStatus(hService, &sStatus) == 0)
+		{
+			break;
+		}
+
+		if (sStatus.dwCurrentState == SERVICE_STOPPED)
+		{
+			ret = TRUE;
+			break;
+		}
+
+		if (ControlService(hService, SERVICE_CONTROL_STOP, &sStatus) == 0)
+		{
+			break;
+		}
+
+		while (1) {
+			if (QueryServiceStatus(hService, &sStatus) == 0)
+			{
+				break;
+			}
+
+			if (sStatus.dwCurrentState == SERVICE_STOPPED)
+			{
+				ret = TRUE;
+				break;
+			}
+
+			if (waited >= sStatus.dwWaitHint)
+			{
+				break;
+			}
+
+			Sleep(500);
+			waited += 500;
+		}
+	}
+	while (0);
+
+	if (hService)
+	{
+		CloseServiceHandle(hService);
+	}
+
+	if (hManager)
+	{
+		CloseServiceHandle(hManager);
+	}
+
+	return ret;
+}
+
+//
+// サービス再起動
+//
+BOOL CWinService::Restart()
+{
+	if (this->Stop())
+	{
+		return this->Start();
+	}
+
+	return FALSE;
+}
+
+//
+// サービス実行
+//
+BOOL CWinService::Run(LPSERVICE_MAIN_FUNCTIONW lpServiceProc)
+{
+	SERVICE_TABLE_ENTRY DispatchTable[] = { { serviceName, lpServiceProc }, { NULL, NULL } };
+	return StartServiceCtrlDispatcher(DispatchTable);
+}
+
+//
+// ServiceMainからサービス開始前に呼び出す
+//
+BOOL CWinService::RegisterService(LPHANDLER_FUNCTION_EX lpHandlerProc)
+{
+	//SCMからの制御ハンドラを登録
+	serviceStatusHandle = RegisterServiceCtrlHandlerEx(serviceName, lpHandlerProc, NULL);
+	if (serviceStatusHandle == 0)
+	{
+		return FALSE;
+	}
+
+	//サービス停止用イベントを作成
+	hServerStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (hServerStopEvent == NULL)
+	{
+		return FALSE;
+	}
+
+	//状態を開始中に設定
+	serviceStatus.dwServiceType = SERVICE_WIN32;
+	serviceStatus.dwCurrentState = SERVICE_START_PENDING;
+	serviceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+	serviceStatus.dwWin32ExitCode = 0;
+	serviceStatus.dwServiceSpecificExitCode = 0;
+	serviceStatus.dwCheckPoint = 1;
+	serviceStatus.dwWaitHint = 30000;
+	SetServiceStatus(serviceStatusHandle, &serviceStatus);
+
+	return TRUE;
+}
+
+//
+// ServiceMainからサービス開始後呼出す。停止要求までreturnしない
+//
+void CWinService::ServiceRunning()
+{
+	//状態を開始に設定
+	serviceStatus.dwCurrentState = SERVICE_RUNNING;
+	serviceStatus.dwCheckPoint = 0;
+	serviceStatus.dwWaitHint = 0;
+	SetServiceStatus(serviceStatusHandle, &serviceStatus);
+
+	//サービス停止要求まで待機し、ループから抜ける
+	::WaitForSingleObject(hServerStopEvent, INFINITE);
+
+	return;
+}
+
+//
+// ServiceMainからサービス終了処理後呼び出す
+//
+void CWinService::ServiceStopped()
+{
+	//イベントクローズ
+	if (hServerStopEvent)
+	{
+		CloseHandle(hServerStopEvent);
+		hServerStopEvent = NULL;
+	}
+
+	//状態を停止に設定
+	serviceStatus.dwCurrentState = SERVICE_STOPPED;
+	serviceStatus.dwCheckPoint = 0;
+	serviceStatus.dwWaitHint = 0;
+	SetServiceStatus(serviceStatusHandle, &serviceStatus);
+
+	return;
+}
+
+//
+// サービスコントロールハンドラ処理
+//
+DWORD WINAPI CWinService::ServiceCtrlHandler(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext)
+{
+	switch (dwControl)
+	{
+	case SERVICE_CONTROL_PAUSE:
+		serviceStatus.dwCurrentState = SERVICE_PAUSED;
+		return NO_ERROR;
+
+	case SERVICE_CONTROL_CONTINUE:
+		serviceStatus.dwCurrentState = SERVICE_RUNNING;
+		return NO_ERROR;
+
+	case SERVICE_CONTROL_STOP:
+		serviceStatus.dwWin32ExitCode = 0;
+		serviceStatus.dwCurrentState = SERVICE_STOP_PENDING;
+		serviceStatus.dwCheckPoint = 0;
+		serviceStatus.dwWaitHint = 50000;
+
+		SetServiceStatus(serviceStatusHandle, &serviceStatus);
+
+		//停止に設定
+		if (hServerStopEvent)
+		{
+			SetEvent(hServerStopEvent);
+		}
+
+		return NO_ERROR;
+
+	case SERVICE_CONTROL_INTERROGATE:
+	case SERVICE_CONTROL_DEVICEEVENT:
+	case SERVICE_CONTROL_HARDWAREPROFILECHANGE:
+	case SERVICE_CONTROL_POWEREVENT:
+		return NO_ERROR;
+	}
+	return ERROR_CALL_NOT_IMPLEMENTED;
+}
+
 #endif
